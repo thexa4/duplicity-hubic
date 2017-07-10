@@ -19,13 +19,11 @@
 # Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 
 import os
-import time
 
 import duplicity.backend
-from duplicity import globals
 from duplicity import log
-from duplicity.errors import * #@UnusedWildImport
-from duplicity.util import exception_traceback
+from duplicity import util
+from duplicity.errors import BackendException
 from duplicity.backend import retry
 
 class HubicBackend(duplicity.backend.Backend):
@@ -89,14 +87,20 @@ class HubicBackend(duplicity.backend.Backend):
             
         self.container = parsed_url.path.lstrip('/')
 
+        container_metadata = None
         try:
             self.conn = Connection(**conn_kwargs)
-            self.conn.put_container(self.container)
-        except Exception, e:
+            container_metadata = self.conn.head_container(self.container)
+        except ClientException:
+            pass
+        except Exception as e:
             log.FatalError("Connection failed: %s %s"
                            % (e.__class__.__name__, str(e)),
                            log.ErrorCode.connection_failed)
 
+        if container_metadata is None:
+            log.Info("Creating container %s" % self.container)
+    
     def getAccessToken(self, client_id, client_secret, refresh_token):
 
         # Fix headers
@@ -162,48 +166,42 @@ class HubicBackend(duplicity.backend.Backend):
         for n in range(1, globals.num_retries+1):
             log.Info("Downloading '%s/%s'" % (self.container, remote_filename))
             try:
-                headers, body = self.conn.get_object(self.container,
-                                                     remote_filename)
-                f = open(local_path.name, 'w')
-                for chunk in body:
-                    f.write(chunk)
-                local_path.setdata()
-                return
-            except self.resp_exc, resperr:
-                log.Warn("Download of '%s' failed (attempt %s): Swift server returned: %s %s"
-                         % (remote_filename, n, resperr.http_status, resperr.message))
-            except Exception, e:
-                log.Warn("Download of '%s' failed (attempt %s): %s: %s"
-                         % (remote_filename, n, e.__class__.__name__, str(e)))
-                log.Debug("Backtrace of previous error: %s"
-                          % exception_traceback())
-            time.sleep(30)
-        log.Warn("Giving up downloading '%s' after %s attempts"
-                 % (remote_filename, globals.num_retries))
-        raise BackendException("Error downloading '%s/%s'"
-                               % (self.container, remote_filename))
+                self.conn.put_container(self.container)
+            except Exception as e:
+                log.FatalError("Container creation failed: %s %s"
+                               % (e.__class__.__name__, str(e)),
+                               log.ErrorCode.connection_failed)
 
-    def list(self):
-        for n in range(1, globals.num_retries+1):
-            log.Info("Listing '%s'" % (self.container))
-            try:
-                # Cloud Files will return a max of 10,000 objects.  We have
-                # to make multiple requests to get them all.
-                headers, objs = self.conn.get_container(self.container)
-                return [ o['name'] for o in objs ]
-            except self.resp_exc, resperr:
-                log.Warn("Listing of '%s' failed (attempt %s): Swift server returned: %s %s"
-                         % (self.container, n, resperr.http_status, resperr.message))
-            except Exception, e:
-                log.Warn("Listing of '%s' failed (attempt %s): %s: %s"
-                         % (self.container, n, e.__class__.__name__, str(e)))
-                log.Debug("Backtrace of previous error: %s"
-                          % exception_traceback())
-            time.sleep(30)
-        log.Warn("Giving up listing of '%s' after %s attempts"
-                 % (self.container, globals.num_retries))
-        raise BackendException("Error listing '%s'"
-                               % (self.container))
+    def _error_code(self, operation, e):
+        if isinstance(e, self.resp_exc):
+            if e.http_status == 404:
+                return log.ErrorCode.backend_not_found
+
+    def _put(self, source_path, remote_filename):
+        self.conn.put_object(self.container, self.prefix + remote_filename,
+                             file(source_path.name))
+
+    def _get(self, remote_filename, local_path):
+        headers, body = self.conn.get_object(self.container, self.prefix + remote_filename)
+        with open(local_path.name, 'wb') as f:
+            for chunk in body:
+                f.write(chunk)
+
+    def _list(self):
+        try:
+            # Cloud Files will return a max of 10,000 objects.  We have
+            # to make multiple requests to get them all.
+            headers, objs = self.conn.get_container(self.container)
+            return [ o['name'] for o in objs ]
+        except self.resp_exc, resperr:
+            log.Warn("Listing of '%s' failed (attempt %s): Swift server returned: %s %s"
+                     % (self.container, n, resperr.http_status, resperr.message))
+        except Exception, e:
+            log.Warn("Listing of '%s' failed (attempt %s): %s: %s"
+                     % (self.container, n, e.__class__.__name__, str(e)))
+            log.Debug("Backtrace of previous error: %s"
+                      % exception_traceback())
+        time.sleep(30)
 
     def delete_one(self, remote_filename):
         for n in range(1, globals.num_retries+1):

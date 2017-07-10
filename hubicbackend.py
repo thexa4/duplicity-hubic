@@ -86,6 +86,7 @@ class HubicBackend(duplicity.backend.Backend):
         conn_kwargs['auth_version'] = '1'
             
         self.container = parsed_url.path.lstrip('/')
+        self.prefix = ''
 
         container_metadata = None
         try:
